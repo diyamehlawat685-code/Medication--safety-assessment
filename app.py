@@ -14,6 +14,11 @@ DATA_FILE = "drug_pairs_processed.csv"
 FILTERED_FILE = "drug_pairs_filtered.csv"
 DDINTER_FILE = "ddinter_data/ddinter_app_lookup.csv"
 
+
+def normalize_drug_name(value):
+    """Normalize case and whitespace without guessing brand/generic equivalence."""
+    return " ".join(str(value).strip().casefold().split())
+
 # ---------- Visual system ----------
 st.markdown("""
 <style>
@@ -212,13 +217,19 @@ def load_data():
     frame = frame.dropna(subset=list(required)).copy()
     frame["drug1"] = frame["drug1"].astype(str).str.strip()
     frame["drug2"] = frame["drug2"].astype(str).str.strip()
+    frame = frame[(frame["drug1"] != "") & (frame["drug2"] != "")]
     frame["report_count"] = pd.to_numeric(frame["report_count"], errors="coerce")
     frame["serious_count"] = pd.to_numeric(frame["serious_count"], errors="coerce")
     frame["serious_ratio"] = pd.to_numeric(frame["serious_ratio"], errors="coerce")
     frame = frame.dropna(subset=["report_count", "serious_count", "serious_ratio"])
-    frame = frame[(frame["report_count"] > 0) & frame["serious_ratio"].between(0,1)]
+    frame = frame[
+        (frame["report_count"] > 0)
+        & frame["serious_count"].between(0, frame["report_count"])
+        & frame["serious_ratio"].between(0, 1)
+    ]
     frame["key"] = frame.apply(
-        lambda r: tuple(sorted((r["drug1"].casefold(), r["drug2"].casefold()))), axis=1
+        lambda r: tuple(sorted((normalize_drug_name(r["drug1"]), normalize_drug_name(r["drug2"])))),
+        axis=1,
     )
     frame = frame.drop_duplicates("key")
     return frame, source
@@ -240,8 +251,10 @@ def load_ddinter_lookup():
         frame["Drug_A"] = frame["Drug_A"].astype(str).str.strip()
         frame["Drug_B"] = frame["Drug_B"].astype(str).str.strip()
         frame["Level"] = frame["Level"].astype(str).str.strip()
+        frame = frame[(frame["Drug_A"] != "") & (frame["Drug_B"] != "") & (frame["Level"] != "")]
         frame["pair_key"] = frame.apply(
-            lambda r: tuple(sorted((r["Drug_A"].casefold(), r["Drug_B"].casefold()))), axis=1
+            lambda r: tuple(sorted((normalize_drug_name(r["Drug_A"]), normalize_drug_name(r["Drug_B"])))),
+            axis=1,
         )
         # Keep one row per unordered pair. Conflicting levels should not be guessed.
         level_counts = frame.groupby("pair_key")["Level"].nunique()
@@ -377,7 +390,7 @@ if page in ("Home", "Drug Pair Explorer"):
         left, right = selected
         st.markdown('<div class="panel">', unsafe_allow_html=True)
         st.markdown('<div class="panel-title">Observed Reporting Statistics</div><div class="panel-sub">Pair-level reporting summary for the selected medicines.</div><div style="height:13px"></div>', unsafe_allow_html=True)
-        if left.casefold() == right.casefold():
+        if normalize_drug_name(left) == normalize_drug_name(right):
             st.markdown("""
             <div style="
                 background-color: #FFF4CC;
@@ -391,7 +404,7 @@ if page in ("Home", "Drug Pair Explorer"):
             </div>
             """, unsafe_allow_html=True)
         else:
-            key = tuple(sorted((left.casefold(), right.casefold())))
+            key = tuple(sorted((normalize_drug_name(left), normalize_drug_name(right))))
 
             # DDInter result is displayed independently; it is not an ML prediction.
             st.markdown("### DDInter interaction evidence")
@@ -448,7 +461,7 @@ elif page == "About Data":
     st.write(f"**Distinct medicine names:** {len(medicines):,}")
     st.write(f"**DDInter lookup:** {'Loaded (' + format(len(ddinter_data), ',') + ' pair records)' if ddinter_data is not None else 'Not loaded'}")
     st.markdown('<div class="info-box">The FAERS table contains medicine pairs co-mentioned in adverse-event reports. Co-reporting alone does not establish that the medicines interacted or caused an event. DDInter levels are displayed separately as database-reported interaction evidence.</div>',unsafe_allow_html=True)
-    st.write("Medicine-name matching is based on the text available in the dataset. Brand names, salt forms, spelling variants, and strengths may be represented separately.")
+    st.write("Medicine-name matching ignores letter case and repeated/leading/trailing spaces. It does not automatically equate brand names, generic names, salt forms, spelling variants, or strengths; these may appear as separate entries.")
 
 elif page == "Methodology":
     st.markdown('<div class="panel"><div class="eyebrow">METHOD</div><div class="panel-title">How pair statistics are produced</div><hr>1. Load FAERS-derived reports collected through openFDA.<br><br>2. Extract medicine names from each report and standardize text casing/whitespace.<br><br>3. Generate unordered medicine pairs within each report.<br><br>4. Count reports mentioning each pair and count those marked serious.<br><br>5. Calculate serious-report proportion = serious_count ÷ report_count.</div>',unsafe_allow_html=True)
