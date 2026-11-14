@@ -12,6 +12,7 @@ st.set_page_config(
 
 DATA_FILE = "drug_pairs_processed.csv"
 FILTERED_FILE = "drug_pairs_filtered.csv"
+DDINTER_FILE = "ddinter_data/ddinter_app_lookup.csv"
 
 # ---------- Visual system ----------
 st.markdown("""
@@ -224,6 +225,34 @@ def load_data():
 
 data, source_name = load_data()
 
+# ---------- DDInter interaction lookup (separate from FAERS statistics) ----------
+@st.cache_data
+def load_ddinter_lookup():
+    path = Path(DDINTER_FILE)
+    if not path.exists():
+        return None
+    try:
+        frame = pd.read_csv(path)
+        required = {"Drug_A", "Drug_B", "Level"}
+        if not required.issubset(frame.columns):
+            return None
+        frame = frame.dropna(subset=["Drug_A", "Drug_B", "Level"]).copy()
+        frame["Drug_A"] = frame["Drug_A"].astype(str).str.strip()
+        frame["Drug_B"] = frame["Drug_B"].astype(str).str.strip()
+        frame["Level"] = frame["Level"].astype(str).str.strip()
+        frame["pair_key"] = frame.apply(
+            lambda r: tuple(sorted((r["Drug_A"].casefold(), r["Drug_B"].casefold()))), axis=1
+        )
+        # Keep one row per unordered pair. Conflicting levels should not be guessed.
+        level_counts = frame.groupby("pair_key")["Level"].nunique()
+        conflicting = set(level_counts[level_counts > 1].index)
+        frame = frame[~frame["pair_key"].isin(conflicting)].drop_duplicates("pair_key")
+        return frame
+    except (OSError, ValueError, pd.errors.ParserError):
+        return None
+
+ddinter_data = load_ddinter_lookup()
+
 # ---------- Sidebar ----------
 with st.sidebar:
     st.markdown('<div style="font-size:2.2rem;margin-bottom:5px">💊</div><div class="brand">MedGuard</div><div class="brand-sub">Medication Safety<br>Assessment System</div>', unsafe_allow_html=True)
@@ -242,7 +271,10 @@ if data is None:
     st.error(f"Could not load a compatible CSV. Put {DATA_FILE} (preferred) or {FILTERED_FILE} in the same folder as app.py.")
     st.stop()
 
-medicines = sorted(set(data["drug1"].tolist()) | set(data["drug2"].tolist()), key=str.casefold)
+medicine_names = set(data["drug1"].tolist()) | set(data["drug2"].tolist())
+if ddinter_data is not None:
+    medicine_names |= set(ddinter_data["Drug_A"].tolist()) | set(ddinter_data["Drug_B"].tolist())
+medicines = sorted(medicine_names, key=str.casefold)
 total_pairs = len(data)
 filtered_count = None
 if Path(FILTERED_FILE).exists():
@@ -336,6 +368,11 @@ if page in ("Home", "Drug Pair Explorer"):
         else:
             st.session_state["last_pair"] = (med_a, med_b)
     selected = st.session_state.get("last_pair")
+    # Never show a previous pair's result after either medicine selector changes.
+    current_pair = (med_a, med_b) if med_a and med_b else None
+    if selected and selected != current_pair:
+        selected = None
+        st.info("Medicine selection changed. Click **Check Pair Statistics** to load results for the new pair.")
     if selected:
         left, right = selected
         st.markdown('<div class="panel">', unsafe_allow_html=True)
@@ -355,6 +392,29 @@ if page in ("Home", "Drug Pair Explorer"):
             """, unsafe_allow_html=True)
         else:
             key = tuple(sorted((left.casefold(), right.casefold())))
+
+            # DDInter result is displayed independently; it is not an ML prediction.
+            st.markdown("### DDInter interaction evidence")
+            if ddinter_data is None:
+                st.info(f"DDInter lookup file not loaded. Keep `{DDINTER_FILE}` in the project folder to enable this section.")
+            else:
+                dd_match = ddinter_data[ddinter_data["pair_key"] == key]
+                if dd_match.empty:
+                    st.markdown('<div class="info-box"><b>Unknown / Not found in DDInter.</b> This pair has no matching record in the loaded lookup. Not found does not mean safe.</div>', unsafe_allow_html=True)
+                else:
+                    dd_rec = dd_match.iloc[0]
+                    dd_level = str(dd_rec["Level"])
+                    level_map = {"major": "High", "moderate": "Moderate", "minor": "Low", "unknown": "Unknown"}
+                    mapped_label = level_map.get(dd_level.casefold(), "Unknown")
+                    st.markdown(
+                        f'<div class="stat-card"><div class="stat-label">DDInter reported interaction level</div>'
+                        f'<div class="stat-value">{html.escape(dd_level)}</div>'
+                        f'<div class="stat-detail">Mapped category: {html.escape(mapped_label)} · Source: DDInter dataset</div></div>',
+                        unsafe_allow_html=True,
+                    )
+                    st.caption("This is a database-reported interaction category, not a personalized clinical assessment or guarantee of harm.")
+
+            st.markdown("### FAERS reporting statistics")
             match = data[data["key"] == key]
             if match.empty:
                 st.markdown('<div class="info-box">This exact combination is not present in the current dataset. Missing data does not mean that the combination is safe.</div>', unsafe_allow_html=True)
@@ -386,7 +446,8 @@ elif page == "About Data":
     st.write(f"**Loaded file:** `{source_name}`")
     st.write(f"**Rows in loaded pair table:** {len(data):,}")
     st.write(f"**Distinct medicine names:** {len(medicines):,}")
-    st.markdown('<div class="info-box">The table contains medicine pairs co-mentioned in adverse-event reports. Co-reporting alone does not establish that the medicines interacted or caused an event.</div>',unsafe_allow_html=True)
+    st.write(f"**DDInter lookup:** {'Loaded (' + format(len(ddinter_data), ',') + ' pair records)' if ddinter_data is not None else 'Not loaded'}")
+    st.markdown('<div class="info-box">The FAERS table contains medicine pairs co-mentioned in adverse-event reports. Co-reporting alone does not establish that the medicines interacted or caused an event. DDInter levels are displayed separately as database-reported interaction evidence.</div>',unsafe_allow_html=True)
     st.write("Medicine-name matching is based on the text available in the dataset. Brand names, salt forms, spelling variants, and strengths may be represented separately.")
 
 elif page == "Methodology":
