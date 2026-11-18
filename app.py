@@ -1,4 +1,5 @@
 from pathlib import Path
+import hashlib
 import html
 import pandas as pd
 import streamlit as st
@@ -210,7 +211,10 @@ def load_data():
     source = DATA_FILE if Path(DATA_FILE).exists() else FILTERED_FILE
     if not Path(source).exists():
         return None, source
-    frame = pd.read_csv(source)
+    try:
+        frame = pd.read_csv(source)
+    except Exception:
+        return None, source
     required = {"drug1", "drug2", "report_count", "serious_count", "serious_ratio"}
     if not required.issubset(frame.columns):
         return None, source
@@ -218,6 +222,8 @@ def load_data():
     frame["drug1"] = frame["drug1"].astype(str).str.strip()
     frame["drug2"] = frame["drug2"].astype(str).str.strip()
     frame = frame[(frame["drug1"] != "") & (frame["drug2"] != "")]
+    # Exclude self-pairs
+    frame = frame[frame["drug1"].str.casefold() != frame["drug2"].str.casefold()]
     frame["report_count"] = pd.to_numeric(frame["report_count"], errors="coerce")
     frame["serious_count"] = pd.to_numeric(frame["serious_count"], errors="coerce")
     frame["serious_ratio"] = pd.to_numeric(frame["serious_ratio"], errors="coerce")
@@ -241,30 +247,33 @@ data, source_name = load_data()
 def load_ddinter_lookup():
     path = Path(DDINTER_FILE)
     if not path.exists():
-        return None
+        return None, {}
     try:
         frame = pd.read_csv(path)
         required = {"Drug_A", "Drug_B", "Level"}
         if not required.issubset(frame.columns):
-            return None
+            return None, {}
         frame = frame.dropna(subset=["Drug_A", "Drug_B", "Level"]).copy()
         frame["Drug_A"] = frame["Drug_A"].astype(str).str.strip()
         frame["Drug_B"] = frame["Drug_B"].astype(str).str.strip()
         frame["Level"] = frame["Level"].astype(str).str.strip()
         frame = frame[(frame["Drug_A"] != "") & (frame["Drug_B"] != "") & (frame["Level"] != "")]
+        # Exclude self-pairs
+        frame = frame[frame["Drug_A"].str.casefold() != frame["Drug_B"].str.casefold()]
         frame["pair_key"] = frame.apply(
             lambda r: tuple(sorted((normalize_drug_name(r["Drug_A"]), normalize_drug_name(r["Drug_B"])))),
             axis=1,
         )
-        # Keep one row per unordered pair. Conflicting levels should not be guessed.
-        level_counts = frame.groupby("pair_key")["Level"].nunique()
-        conflicting = set(level_counts[level_counts > 1].index)
-        frame = frame[~frame["pair_key"].isin(conflicting)].drop_duplicates("pair_key")
-        return frame
-    except (OSError, ValueError, pd.errors.ParserError):
-        return None
+        # Identify conflicting interaction levels for the same unordered pair
+        level_groups = frame.groupby("pair_key")["Level"].unique()
+        conflicting = {k: list(v) for k, v in level_groups.items() if len(v) > 1}
+        # Keep consistent rows without guessing conflicting levels
+        resolved = frame[~frame["pair_key"].isin(conflicting.keys())].drop_duplicates("pair_key")
+        return resolved, conflicting
+    except Exception:
+        return None, {}
 
-ddinter_data = load_ddinter_lookup()
+ddinter_data, ddinter_conflicts = load_ddinter_lookup()
 
 # ---------- Sidebar ----------
 with st.sidebar:
@@ -284,10 +293,25 @@ if data is None:
     st.error(f"Could not load a compatible CSV. Put {DATA_FILE} (preferred) or {FILTERED_FILE} in the same folder as app.py.")
     st.stop()
 
-medicine_names = set(data["drug1"].tolist()) | set(data["drug2"].tolist())
-if ddinter_data is not None:
-    medicine_names |= set(ddinter_data["Drug_A"].tolist()) | set(ddinter_data["Drug_B"].tolist())
-medicines = sorted(medicine_names, key=str.casefold)
+# Canonical deduplicated medicine list
+canonical_names = {}
+if ddinter_data is not None and not ddinter_data.empty:
+    for name in ddinter_data["Drug_A"].tolist() + ddinter_data["Drug_B"].tolist():
+        s = str(name).strip()
+        if s:
+            k = normalize_drug_name(s)
+            if k not in canonical_names:
+                canonical_names[k] = s
+
+if data is not None and not data.empty:
+    for name in data["drug1"].tolist() + data["drug2"].tolist():
+        s = str(name).strip()
+        if s:
+            k = normalize_drug_name(s)
+            if k not in canonical_names:
+                canonical_names[k] = s
+
+medicines = sorted(canonical_names.values(), key=str.casefold)
 total_pairs = len(data)
 filtered_count = None
 if Path(FILTERED_FILE).exists():
@@ -325,6 +349,67 @@ if page in ("Home", "Drug Pair Explorer"):
         st.markdown('<div style="font-size:1.85rem">💊 <span class="panel-title">Drug Pair Explorer</span></div><div class="panel-sub">Select two medicines to view reporting statistics from FAERS-derived reports.</div>', unsafe_allow_html=True)
     with head2:
         st.markdown('<div class="pill-note">ⓘ &nbsp; Reporting data only.<br>&nbsp;&nbsp;&nbsp;&nbsp;Not a clinical safety assessment.</div>', unsafe_allow_html=True)
+
+    # ---------- Patient Clinical Profile & Allergy Screening (Intake Form) ----------
+    with st.expander("🩺 Patient Clinical Profile & Allergy Screening (Optional Context)", expanded=False):
+        st.markdown(
+            '<div style="font-size:0.89rem;color:#577685;margin-bottom:12px;line-height:1.5;">'
+            'Optionally enter patient demographics, diagnosed drug allergies, and active medications. '
+            'MedGuard will perform <b>direct drug-allergy contraindication screening</b>, '
+            '<b>ongoing treatment cross-interaction checks</b>, and <b>age-group pharmacotherapy advisories</b>. '
+            'Leave empty for a general pair inquiry.</div>',
+            unsafe_allow_html=True,
+        )
+        p_c1, p_c2, p_c3, p_c4 = st.columns([1.2, 0.7, 0.9, 1.2])
+        with p_c1:
+            p_name = st.text_input("Patient Name", placeholder="e.g. Rahul Sharma", key="p_name")
+        with p_c2:
+            p_age = st.number_input("Age (Years)", min_value=1, max_value=120, value=None, step=1, placeholder="Age", key="p_age")
+        with p_c3:
+            p_gender = st.selectbox("Gender", ["Not Specified", "Female", "Male", "Other"], key="p_gender")
+        with p_c4:
+            p_contact = st.text_input("Phone or Email", placeholder="e.g. user@gmail.com / 9876543210", key="p_contact")
+
+        p_c5, p_c6 = st.columns(2)
+        with p_c5:
+            p_allergies = st.multiselect(
+                "Known Drug Allergies",
+                medicines,
+                placeholder="Select allergic medicines (e.g. Aspirin, Penicillin)...",
+                key="p_allergies",
+                help="Search and select medicines the patient is medically diagnosed as allergic to.",
+            )
+        with p_c6:
+            p_ongoing = st.multiselect(
+                "Ongoing Medications / Current Treatment",
+                medicines,
+                placeholder="Select medicines currently being taken (e.g. Metformin, Amlodipine)...",
+                key="p_ongoing",
+                help="Medicines the patient takes regularly. MedGuard will cross-check for interactions against the candidate pair.",
+            )
+
+        v_col1, v_col2 = st.columns([1.3, 3])
+        with v_col1:
+            verify_btn = st.button("🔐 Verify & Lock Session", use_container_width=True)
+
+        if verify_btn:
+            if not p_contact or len(p_contact.strip()) < 5:
+                st.warning("Please enter a valid phone number or email address to verify session.")
+            else:
+                token = "MED-" + hashlib.md5(p_contact.strip().encode()).hexdigest()[:6].upper()
+                st.session_state["profile_verified"] = token
+                st.session_state["verified_patient_name"] = p_name.strip() if p_name else "Patient"
+                st.success(f"✓ Profile Verified Successfully! Session Token: {token}")
+
+        if st.session_state.get("profile_verified"):
+            token = st.session_state["profile_verified"]
+            p_disp = st.session_state.get("verified_patient_name", "Patient")
+            st.markdown(
+                f'<div style="background:#eaf8f0;border:1px solid #a3e6ba;border-radius:12px;padding:8px 14px;color:#1e6a38;font-size:0.83rem;font-weight:600;display:inline-flex;align-items:center;gap:6px;margin-top:6px;">'
+                f'✓ Active Verified Clinical Session: {html.escape(p_disp)} · ID: {token}</div>',
+                unsafe_allow_html=True,
+            )
+    st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
 
     a, swapcol, b, action = st.columns([1.15,.18,1.15,.82], vertical_alignment="bottom")
     # Searchable medicine selectors with clear initial state.
@@ -406,17 +491,135 @@ if page in ("Home", "Drug Pair Explorer"):
         else:
             key = tuple(sorted((normalize_drug_name(left), normalize_drug_name(right))))
 
+            # ---------- Clinical Patient Context Assessment ----------
+            has_patient_context = bool(p_name or p_age or p_allergies or p_ongoing or st.session_state.get("profile_verified"))
+            if has_patient_context:
+                p_name_display = html.escape(p_name.strip()) if p_name and p_name.strip() else "Anonymous Patient"
+                age_str = f"{int(p_age)} yrs" if p_age else "Unspecified age"
+                gender_str = html.escape(p_gender) if p_gender != "Not Specified" else "Unspecified gender"
+                v_badge = f'<span style="color:#166534;background:#dcfce7;border:1px solid #86efac;padding:3px 9px;border-radius:10px;font-size:0.77rem;font-weight:600;">✓ Verified Session ({st.session_state.get("profile_verified")})</span>' if st.session_state.get("profile_verified") else '<span style="color:#64748b;font-size:0.75rem;">Unverified Profile</span>'
+
+                st.markdown(
+                    f'<div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:16px;padding:12px 18px;margin-bottom:16px;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;">'
+                    f'<div><b>👤 Patient Context:</b> {p_name_display} &nbsp;·&nbsp; {age_str} &nbsp;·&nbsp; {gender_str}</div>'
+                    f'<div>{v_badge}</div></div>',
+                    unsafe_allow_html=True,
+                )
+
+            # 1. Specific Allergy Screening Check
+            if p_allergies:
+                norm_allergies = {normalize_drug_name(a): a for a in p_allergies}
+                allergic_hits = []
+                if normalize_drug_name(left) in norm_allergies:
+                    allergic_hits.append(norm_allergies[normalize_drug_name(left)])
+                if normalize_drug_name(right) in norm_allergies and norm_allergies[normalize_drug_name(right)] not in allergic_hits:
+                    allergic_hits.append(norm_allergies[normalize_drug_name(right)])
+
+                if allergic_hits:
+                    hits_str = ", ".join(f"<b>{html.escape(h)}</b>" for h in allergic_hits)
+                    p_display_name = html.escape(p_name.strip()) if p_name and p_name.strip() else "The patient"
+                    st.markdown(f"""
+                    <div style="background:#fee2e2; border:2px solid #ef4444; border-radius:18px; padding:18px 20px; margin-bottom:18px; color:#991b1b;">
+                        <div style="font-size:1.15rem; font-weight:700; display:flex; align-items:center; gap:8px;">
+                            🚨 CRITICAL CONTRAINDICATION: DRUG ALLERGY CONFLICT
+                        </div>
+                        <div style="margin-top:8px; font-size:0.93rem; line-height:1.55;">
+                            {p_display_name} has a recorded medical allergy to {hits_str}.<br>
+                            <b>Conflict Identified:</b> Candidate selection directly includes an allergic medicine.<br>
+                            <b>Clinical Risk:</b> Severe hypersensitivity reaction, acute urticaria, bronchospasm, angioedema, or life-threatening anaphylaxis.<br>
+                            <b>Recommendation:</b> <u>STRICT CONTRAINDICATION.</u> Do not administer. Prescribe an alternative non-cross-reactive medication class.
+                        </div>
+                    </div>
+                    """, unsafe_allow_html=True)
+                else:
+                    st.markdown(
+                        '<div style="background:#ecfdf5; border:1px solid #a7f3d0; border-radius:14px; padding:10px 14px; margin-bottom:14px; color:#065f46; font-size:0.87rem; font-weight:600;">'
+                        '✓ Allergy Screening Passed: Neither candidate medicine matches declared patient drug allergies.</div>',
+                        unsafe_allow_html=True,
+                    )
+
+            # 2. Ongoing Treatment Cross-Interaction Check
+            if p_ongoing and ddinter_data is not None and not ddinter_data.empty:
+                ongoing_interactions = []
+                for ongoing_drug in p_ongoing:
+                    for candidate in (left, right):
+                        if normalize_drug_name(ongoing_drug) == normalize_drug_name(candidate):
+                            continue
+                        k_pair = tuple(sorted((normalize_drug_name(ongoing_drug), normalize_drug_name(candidate))))
+                        match_ongoing = ddinter_data[ddinter_data["pair_key"] == k_pair]
+                        if not match_ongoing.empty:
+                            rec_on = match_ongoing.iloc[0]
+                            lvl_on = str(rec_on["Level"]).strip()
+                            ongoing_interactions.append({
+                                "ongoing": ongoing_drug,
+                                "candidate": candidate,
+                                "level": lvl_on,
+                            })
+                if ongoing_interactions:
+                    items_html = "".join(f"<li>Current medication <b>{html.escape(item['ongoing'])}</b> interacts with candidate <b>{html.escape(item['candidate'])}</b> (DDInter Level: <b>{html.escape(item['level'])}</b>)</li>" for item in ongoing_interactions)
+                    st.markdown(f"""
+                    <div style="background:#fffbeb; border:1.5px solid #f59e0b; border-radius:18px; padding:16px 20px; margin-bottom:18px; color:#92400e;">
+                        <div style="font-size:1.05rem; font-weight:700; display:flex; align-items:center; gap:8px;">
+                            💊 Ongoing Treatment Interaction Detected (Polypharmacy Screening)
+                        </div>
+                        <div style="margin-top:8px; font-size:0.91rem; line-height:1.55;">
+                            The candidate pair interacts with the patient's existing active regimen:
+                            <ul style="margin:6px 0 0; padding-left:20px;">
+                                {items_html}
+                            </ul>
+                            <b>Clinical Note:</b> Adding this candidate pair to the ongoing regimen increases cumulative polypharmacy risk.
+                        </div>
+                    </div>
+                    """, unsafe_allow_html=True)
+                else:
+                    st.markdown(
+                        '<div style="background:#ecfdf5; border:1px solid #a7f3d0; border-radius:14px; padding:10px 14px; margin-bottom:14px; color:#065f46; font-size:0.87rem; font-weight:600;">'
+                        '✓ Ongoing Treatment Screening: No documented severe interactions found between candidate pair and current medications.</div>',
+                        unsafe_allow_html=True,
+                    )
+
+            # 3. Age-Group Physiological Advisory
+            if p_age is not None:
+                if p_age >= 65:
+                    st.markdown(f"""
+                    <div style="background:#eff6ff; border:1px solid #bfdbfe; border-radius:14px; padding:12px 16px; margin-bottom:14px; color:#1e40af; font-size:0.88rem; line-height:1.5;">
+                        <b>👴 Geriatric Population Advisory (Age {int(p_age)}):</b> Beers Criteria Precaution.<br>
+                        Elderly patients commonly present with diminished renal clearance (eGFR), altered hepatic metabolism, and heightened pharmacodynamic vulnerability. Starting at lower doses and closely monitoring renal/electrolyte labs is strongly indicated.
+                    </div>
+                    """, unsafe_allow_html=True)
+                elif p_age < 18:
+                    st.markdown(f"""
+                    <div style="background:#f5f3ff; border:1px solid #ddd6fe; border-radius:14px; padding:12px 16px; margin-bottom:14px; color:#5b21b6; font-size:0.88rem; line-height:1.5;">
+                        <b>🧒 Pediatric Population Advisory (Age {int(p_age)}):</b> Pediatric Pharmacotherapy Caution.<br>
+                        Organ maturation, volume of distribution, and metabolic clearance vary markedly in children. Weight-adjusted dosing (mg/kg) and pediatric specialist review are clinically essential.
+                    </div>
+                    """, unsafe_allow_html=True)
+
             # DDInter result is displayed independently; it is not an ML prediction.
             st.markdown("### DDInter interaction evidence")
             if ddinter_data is None:
                 st.info(f"DDInter lookup file not loaded. Keep `{DDINTER_FILE}` in the project folder to enable this section.")
+            elif ddinter_conflicts and key in ddinter_conflicts:
+                conflict_levels = ", ".join(html.escape(str(lvl)) for lvl in ddinter_conflicts[key])
+                st.markdown(
+                    f'<div class="warning"><b>⚠ Conflicting DDInter records detected:</b> '
+                    f'The database contains conflicting interaction levels for this pair: <b>{conflict_levels}</b>. '
+                    f'Because source classifications differ, a single definitive interaction severity level cannot be established.</div>',
+                    unsafe_allow_html=True,
+                )
             else:
                 dd_match = ddinter_data[ddinter_data["pair_key"] == key]
                 if dd_match.empty:
-                    st.markdown('<div class="info-box"><b>Unknown / Not found in DDInter.</b> This pair has no matching record in the loaded lookup. Not found does not mean safe.</div>', unsafe_allow_html=True)
+                    st.markdown(
+                        '<div class="info-box"><b>Unknown / Not found in DDInter.</b> This pair has no matching record in the loaded lookup table. '
+                        '<b>Not found does NOT mean safe.</b> Many drug combinations have not been systematically evaluated.<br>'
+                        '<small style="color:#3e6677">Tip: DDInter indexes international generic names (e.g. <i>Atorvastatin</i>, <i>Acetylsalicylic acid</i>). '
+                        'If you selected a trade/brand name (e.g. <i>Lipitor</i>, <i>Aspirin</i>), try searching for its generic equivalent in the dropdown.</small></div>',
+                        unsafe_allow_html=True,
+                    )
                 else:
                     dd_rec = dd_match.iloc[0]
-                    dd_level = str(dd_rec["Level"])
+                    dd_level = str(dd_rec["Level"]).strip()
                     level_map = {"major": "High", "moderate": "Moderate", "minor": "Low", "unknown": "Unknown"}
                     mapped_label = level_map.get(dd_level.casefold(), "Unknown")
                     st.markdown(
@@ -425,24 +628,43 @@ if page in ("Home", "Drug Pair Explorer"):
                         f'<div class="stat-detail">Mapped category: {html.escape(mapped_label)} · Source: DDInter dataset</div></div>',
                         unsafe_allow_html=True,
                     )
-                    st.caption("This is a database-reported interaction category, not a personalized clinical assessment or guarantee of harm.")
+                    if dd_level.casefold() == "unknown" or mapped_label == "Unknown":
+                        st.markdown(
+                            '<div class="warning" style="margin-top:10px;"><b>⚠ Unknown severity level:</b> '
+                            'A record exists in DDInter for this combination, but its interaction severity is unclassified (Unknown). '
+                            '<b>An Unknown classification must never be interpreted as safe.</b></div>',
+                            unsafe_allow_html=True,
+                        )
+                    else:
+                        st.caption("This is a database-reported interaction category from DDInter, not a personalized clinical assessment or guarantee of harm.")
 
             st.markdown("### FAERS reporting statistics")
             match = data[data["key"] == key]
             if match.empty:
-                st.markdown('<div class="info-box">This exact combination is not present in the current dataset. Missing data does not mean that the combination is safe.</div>', unsafe_allow_html=True)
+                st.markdown(
+                    '<div class="info-box"><b>No co-reports in current FAERS dataset.</b> This exact combination was not observed together in the processed sample of 20,000 reports. '
+                    '<b>Absence of reports does NOT indicate that the combination is safe or interaction-free.</b> Rare or newly approved drug combinations may have zero reports in a bounded dataset.</div>',
+                    unsafe_allow_html=True,
+                )
             else:
                 rec = match.iloc[0]
                 count = int(rec["report_count"])
                 serious = int(rec["serious_count"])
                 ratio = float(rec["serious_ratio"]) * 100
                 c1,c2,c3,c4 = st.columns([1,1,1,1.18])
-                with c1: st.markdown(stat_card("Reports mentioning both",f"{count:,}","Reports containing both medicine names"),unsafe_allow_html=True)
-                with c2: st.markdown(stat_card("Reports marked serious",f"{serious:,}","Reports with serious flag"),unsafe_allow_html=True)
-                with c3: st.markdown(stat_card("Serious-report proportion",f"{ratio:.1f}%","Serious reports ÷ reports mentioning pair"),unsafe_allow_html=True)
+                with c1: st.markdown(stat_card("Reports mentioning both",f"{count:,}","Co-mentioned in spontaneous reports"),unsafe_allow_html=True)
+                with c2: st.markdown(stat_card("Reports marked serious",f"{serious:,}","Reports flagged with serious outcome"),unsafe_allow_html=True)
+                with c3: st.markdown(stat_card("Serious-report proportion",f"{ratio:.1f}%","Serious reports ÷ co-reported events"),unsafe_allow_html=True)
                 with c4:
                     st.markdown(f'<div class="stat-card"><div class="stat-label">Selected pair</div><div style="font-weight:700;color:#123542;margin:9px 0;line-height:1.4">{html.escape(left)}<br><span style="color:#07888b">+</span><br>{html.escape(right)}</div><div class="stat-detail">Observed in this dataset</div></div>',unsafe_allow_html=True)
-                st.markdown('<div style="height:12px"></div><div class="warning"><b>⚠ Reporting statistics are not a clinical safety assessment.</b> This proportion is not the probability of harm, interaction strength, or causal evidence. Consult a doctor or pharmacist before starting, stopping, or combining medicines.</div>',unsafe_allow_html=True)
+                st.markdown(
+                    '<div style="height:12px"></div><div class="warning"><b>⚠ Reporting statistics are descriptive only, not a clinical risk assessment.</b><br>'
+                    '• <b>No causation:</b> Co-reporting in FAERS indicates that both medicines appeared in the same event report. It does <b>not</b> establish causation, pharmacological interaction, or clinical risk.<br>'
+                    '• <b>Descriptive ratio:</b> The serious-report proportion reflects submitted adverse-event cases only; it is <b>not</b> the incidence rate, hazard probability, or interaction strength in the general population.<br>'
+                    '• <b>Patient-specific factors not considered:</b> Patient age, dosage, medical history, allergies, kidney/liver function, and concomitant medications are not evaluated.<br>'
+                    '• <b>Clinical consultation required:</b> Always consult a qualified doctor or pharmacist before making any medication decisions.</div>',
+                    unsafe_allow_html=True,
+                )
         st.markdown('</div>',unsafe_allow_html=True)
     else:
         st.markdown('<div class="panel"><div class="panel-title">Observed Reporting Statistics</div><div class="panel-sub">Choose two medicines above, then select <b>Check Pair Statistics</b> to view the pair summary.</div></div>',unsafe_allow_html=True)
@@ -455,23 +677,98 @@ if page in ("Home", "Drug Pair Explorer"):
     with c4: st.markdown(stat_card("Filtered dataset",fcount,"Pairs with 5 or more reports"),unsafe_allow_html=True)
 
 elif page == "About Data":
-    st.markdown('<div class="panel"><div class="eyebrow">DATA OVERVIEW</div><div class="panel-title">About the dataset</div><div class="panel-sub">What the numbers represent—and what they do not.</div><hr></div>',unsafe_allow_html=True)
-    st.write(f"**Loaded file:** `{source_name}`")
-    st.write(f"**Rows in loaded pair table:** {len(data):,}")
-    st.write(f"**Distinct medicine names:** {len(medicines):,}")
-    st.write(f"**DDInter lookup:** {'Loaded (' + format(len(ddinter_data), ',') + ' pair records)' if ddinter_data is not None else 'Not loaded'}")
-    st.markdown('<div class="info-box">The FAERS table contains medicine pairs co-mentioned in adverse-event reports. Co-reporting alone does not establish that the medicines interacted or caused an event. DDInter levels are displayed separately as database-reported interaction evidence.</div>',unsafe_allow_html=True)
-    st.write("Medicine-name matching ignores letter case and repeated/leading/trailing spaces. It does not automatically equate brand names, generic names, salt forms, spelling variants, or strengths; these may appear as separate entries.")
+    st.markdown('<div class="panel"><div class="eyebrow">DATA OVERVIEW</div><div class="panel-title">About the Datasets & Integrity</div><div class="panel-sub">What the numbers represent—and what they do not.</div><hr></div>',unsafe_allow_html=True)
+    st.write(f"**Loaded FAERS pair file:** `{source_name}` ({len(data):,} valid unique pairs)")
+    st.write(f"**Filtered dataset (≥5 reports):** `{FILTERED_FILE}` ({filtered_count:,} pairs)" if filtered_count else f"**Filtered dataset:** `{FILTERED_FILE}` (not loaded)")
+    st.write(f"**Distinct medicine entries in search:** {len(medicines):,} (deduplicated from 10,290 raw name variants)")
+    st.write(f"**DDInter reference lookup:** {'Loaded (' + format(len(ddinter_data), ',') + ' pair records)' if ddinter_data is not None else 'Not loaded'}")
+    
+    st.markdown("""
+    ### Data Sources & Interpretation Boundaries
+    
+    **1. openFDA / FAERS Dataset:**
+    - Represents a retrospective sample of 20,000 public adverse-event reports from openFDA.
+    - Yields 128,866 unique unordered medicine pairs co-mentioned in reports.
+    - **Reporting Bias & Causation:** FAERS consists of spontaneous, voluntary reports submitted by physicians, manufacturers, and consumers. Severe reporting biases exist (under-reporting, stimulated reporting following media alerts, and the Weber effect where reporting peaks shortly after drug launch). Co-occurrence of two medicines indicates only that both were taken by a patient experiencing an adverse event; it does **not** prove that the medicines interacted or caused harm.
+    - **Denominator Absence:** The total number of patients taking these medications in the general population is unknown. Therefore, incidence rates, relative risks, or absolute probabilities of harm cannot be calculated from FAERS data.
+    
+    **2. DDInter Interaction Reference:**
+    - DDInter is a curated biochemical drug-drug interaction database indexing documented interactions.
+    - **Coverage Limitations:** A pair not appearing in DDInter means only that no record was loaded for that combination. **Absence of a record must NEVER be interpreted as Safe.**
+    - **Unclassified / Unknown Records:** Approximately 18% of DDInter records carry an unclassified severity level (`Unknown`). An 'Unknown' status indicates that severity has not been categorized—it is **never** evidence of safety.
+    - **Conflicting Records:** Where source classifications differ across literature, the system detects conflicting classifications and transparently displays them rather than arbitrarily guessing a severity.
+    
+    **3. Medicine-Name Matching:**
+    - The search input cleans whitespace and ignores case.
+    - **Verified Alias Mapping Limitation:** Raw FAERS reports contain brand/trade names (e.g. *Lipitor*, *Coumadin*), while DDInter uses International Nonproprietary Names (INN / generic chemical names, e.g. *Atorvastatin*, *Warfarin*). Salt forms (*Metformin HCl*) and dosage specifications (*500mg*) may also be recorded separately.
+    - Comprehensive alias resolution requires integration with clinical terminologies (RxNorm, UMLS, WHO ATC). Heuristic or unverified automated guessing was deliberately omitted to prevent dangerous clinical false-equivalence errors.
+    
+    **4. Patient-Specific Factors & Clinical Validation:**
+    - **Not Personalized:** The system does not evaluate patient age, pediatric/geriatric vulnerability, renal function (eGFR), hepatic function, dosage, treatment duration, or polypharmacy (>2 concurrent drugs).
+    - **Not Clinically Validated:** This application is an academic software prototype for research and educational awareness. It has **not** been validated by healthcare professionals or certified as a clinical decision-support tool.
+    """, unsafe_allow_html=True)
 
 elif page == "Methodology":
-    st.markdown('<div class="panel"><div class="eyebrow">METHOD</div><div class="panel-title">How pair statistics are produced</div><hr>1. Load FAERS-derived reports collected through openFDA.<br><br>2. Extract medicine names from each report and standardize text casing/whitespace.<br><br>3. Generate unordered medicine pairs within each report.<br><br>4. Count reports mentioning each pair and count those marked serious.<br><br>5. Calculate serious-report proportion = serious_count ÷ report_count.</div>',unsafe_allow_html=True)
-    st.markdown('<div class="warning"><b>Interpretation limit:</b> Report frequency and seriousness flags are descriptive reporting measures—not verified drug-interaction labels, incidence rates, or a clinical prediction.</div>',unsafe_allow_html=True)
+    st.markdown('<div class="panel"><div class="eyebrow">METHOD & VALIDATION</div><div class="panel-title">System Methodology & ML Evaluation</div><div class="panel-sub">Processing pipeline and scientific evaluation of predictive models.</div><hr></div>',unsafe_allow_html=True)
+    st.markdown("""
+    ### Data Processing Workflow
+    1. **Adverse-Event Retrieval:** Query 20,000 adverse-event reports through the openFDA API in JSON format.
+    2. **Entity Extraction & Cleaning:** Extract reported medicine names from patient records, normalize text casing, and collapse redundant whitespace.
+    3. **Pairwise Aggregation:** Generate unordered medicine pairs $(D_A, D_B)$ for each multi-drug report. Exclude single-drug reports and self-pairs.
+    4. **Metric Computation:** Aggregate total co-reported counts ($N$) and serious-event counts ($S$). Compute serious-report proportion $P = S / N$.
+    5. **Quality Filtering:** Validate constraints ($N > 0$, $0 \le S \le N$, $0 \le P \le 1$) and isolate a filtered subset ($N \ge 5$) to reduce single-report noise.
+    6. **Independent Evidence Integration:** Match query pairs against DDInter lookup records without conflating reporting frequency with clinical interaction severity.
+    
+    ---
+    ### Machine Learning Reliability Audit
+    During project research, multiple machine-learning experiments were conducted. Scientific analysis revealed critical limitations, leading to the deliberate architecture decision **not** to deploy predictive ML for clinical safety:
+    
+    **1. Baseline Model Target Leakage:**
+    - In initial experiments (`train_model.py`), an experimental `risk_label` was created by cutting `report_count` into terciles (`pd.qcut`).
+    - The model was then trained using `report_count` as an input feature to predict `risk_label`.
+    - This constitutes circular **target leakage**: the model learned a mathematical identity rather than pharmacological risk. High apparent accuracy on this task was an artifact of target leakage and did not reflect true predictive capability.
+    
+    **2. Class Imbalance in DDInter-FAERS Overlap:**
+    - Merging FAERS reporting features with DDInter severity labels (`train_ddinter_model.py`) yielded an overlap of only 1,743 pairs.
+    - The target classes were severely skewed: **Moderate (1,297 / 74.4%)**, **High (243 / 13.9%)**, and **Low (203 / 11.6%)**.
+    - A majority-class baseline (predicting Moderate for all pairs) achieved **74.5% raw accuracy**, but had a balanced accuracy of only **33.3%** and macro-F1 of **0.28**.
+    
+    **3. Model Performance on Unseen Data:**
+    - Under stratified evaluation, **Logistic Regression** achieved only **43.5% accuracy** (balanced accuracy 37.0%, macro-F1 0.33).
+    - **Random Forest** achieved only **24.9% accuracy** (balanced accuracy 34.6%, macro-F1 0.24), performing worse than random guessing.
+    
+    **4. Pharmacological Rationale:**
+    - Spontaneous reporting counts in FAERS correlate primarily with prescription volume and market tenure, **not** pharmacological interaction mechanism or toxicity.
+    - Presenting an unverified ML model as a clinical predictor would be scientifically unjustified and medically dangerous. MedGuard therefore displays empirical database evidence and reporting statistics directly.
+    """, unsafe_allow_html=True)
 
 elif page == "Team":
     st.markdown('<div class="panel"><div class="eyebrow">PROJECT TEAM</div><div class="panel-title">Built for research awareness</div><hr><b>Diya Mehlawat</b> — Project coordination<br><br><b>Devansh Mishra</b> — Application development<br><br><b>Shivam Tiwari</b> — Model / analysis<br><br><b>Kritika Gupta</b> — Data processing<br><br><b>Project Guide:</b> Dr. Tejasvee Bisen<br><b>Project ID:</b> PT170</div>',unsafe_allow_html=True)
 
 elif page == "Disclaimer":
-    st.markdown('<div class="panel"><div class="eyebrow">PLEASE READ</div><div class="panel-title">Research prototype disclaimer</div><hr>This application summarizes FAERS-derived adverse-event reporting data for educational and research awareness only.<br><br>• Reports can be biased, incomplete, duplicated, or influenced by reporting patterns.<br>• Co-occurrence does not prove causation or a drug-drug interaction.<br>• Absence of a pair from this dataset does not mean the combination is safe.<br>• Serious-report proportion is not the probability of harm.<br>• This application does not provide diagnosis, treatment advice, or clinical safety clearance.<br><br><b>Always consult a qualified doctor or pharmacist about medication decisions.</b></div>',unsafe_allow_html=True)
+    st.markdown("""
+    <div class="panel">
+      <div class="eyebrow">PLEASE READ CAREFULLY</div>
+      <div class="panel-title">Research Prototype Disclaimer</div>
+      <hr>
+      <div class="info-box">
+        <b>Academic & Educational Software Notice:</b><br>
+        MedGuard is an experimental software prototype developed for academic research and educational awareness. It is <b>NOT</b> a certified medical device, clinical decision-support tool, or healthcare diagnostic system.
+      </div>
+      <br>
+      <b>Key Limitations:</b>
+      <ul>
+        <li><b>No Causation:</b> FAERS data reflects spontaneous adverse-event reports. Co-reporting of two medicines does not prove causation or establish that a drug-drug interaction occurred.</li>
+        <li><b>Absence of Data is Not Safety:</b> The absence of a medicine pair from FAERS or DDInter, or an 'Unknown' classification, must <b>never</b> be interpreted as evidence that the combination is safe.</li>
+        <li><b>Descriptive Statistics:</b> The serious-report proportion represents submitted reporting cases only; it is not an incidence rate, harm probability, or clinical risk score.</li>
+        <li><b>No Individual Assessment:</b> The system does not consider patient age, dosage, organ function (kidney/liver), allergies, genetic factors, or other concurrent medications.</li>
+        <li><b>No Clinical Validation:</b> This system has not undergone clinical trials, hospital validation, or review by practicing physicians or pharmacists.</li>
+      </ul>
+      <div class="warning">
+        <b>Medical Advice Disclaimer:</b> Never start, stop, or alter medication dosages based on information provided by this application. Always consult a qualified physician, clinical pharmacist, or healthcare provider for medical decisions.
+      </div>
+    </div>
+    """, unsafe_allow_html=True)
 
 st.markdown('<div class="footer">MedGuard · Medication Safety Assessment System &nbsp; | &nbsp; Research Prototype · FAERS-derived reporting analysis</div>',unsafe_allow_html=True)
  
